@@ -1,0 +1,26 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    {
+      "type": "Feature",
+      "properties": { "risk": "High" },
+      "geometry": {
+        "type": "Polygon",
+        "coordinates": [
+          [
+            [50, 10],
+            [60, 10],
+            [60, 5],
+            [50, 5],
+            [50, 10]
+          ]
+        ]
+      }
+    },
+    {
+      "type": "Feature",
+      "properties": { "risk": "Medium" },
+      "geometry": { "type": "Point", "coordinates": [45, 12] }
+    }
+  ]
+}

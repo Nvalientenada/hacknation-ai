@@ -1,0 +1,10 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature", "properties": { "name": "Port of Los Angeles" }, "geometry": { "type": "Point", "coordinates": [-118.2641, 33.7329] } },
+    { "type": "Feature", "properties": { "name": "Port of San Francisco" }, "geometry": { "type": "Point", "coordinates": [-122.3867, 37.7749] } },
+    { "type": "Feature", "properties": { "name": "Port of New York" }, "geometry": { "type": "Point", "coordinates": [-74.006, 40.6892] } },
+    { "type": "Feature", "properties": { "name": "Port of Lisbon" }, "geometry": { "type": "Point", "coordinates": [-9.1393, 38.7223] } },
+    { "type": "Feature", "properties": { "name": "Port of Tokyo" }, "geometry": { "type": "Point", "coordinates": [139.7506, 35.6579] } }
+  ]
+}
