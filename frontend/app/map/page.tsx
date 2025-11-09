@@ -1,7 +1,7 @@
 'use client';
 
-import { useMemo, useRef, useState } from 'react';
-import Map, { Source, Layer, Marker, type LayerProps, MapRef } from 'react-map-gl';
+import { useEffect, useMemo, useRef, useState } from 'react';
+import Map, { Source, Layer, Marker, type LayerProps, type MapRef } from 'react-map-gl';
 import type { FeatureCollection, LineString } from 'geojson';
 import Spinner from '@/components/Spinner';
 import Toast from '@/components/Toast';
@@ -32,10 +32,32 @@ export default function MapPage() {
   const [err, setErr] = useState<string | null>(null);
 
   const mapRef = useRef<MapRef | null>(null);
+
+  // ---------- Helpers ----------
   const asNum = (v: string | number) => Number(v);
   const validLat = (v: number) => v >= -90 && v <= 90;
   const validLon = (v: number) => v >= -180 && v <= 180;
 
+  // ---------- Preload from query string once ----------
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    const q = new URLSearchParams(window.location.search);
+    const oLat = q.get('oLat'); const oLon = q.get('oLon');
+    const dLat = q.get('dLat'); const dLon = q.get('dLon');
+    const spd  = q.get('spd');
+
+    setForm(f => ({
+      ...f,
+      originLat: oLat ?? f.originLat,
+      originLon: oLon ?? f.originLon,
+      destLat:   dLat ?? f.destLat,
+      destLon:   dLon ?? f.destLon,
+      speedKts:  spd  ?? f.speedKts,
+    }));
+    // do not auto-plan; user clicks "Plan route" (safer & clearer)
+  }, []);
+
+  // ---------- Derived stats ----------
   const distanceNm = useMemo(() => {
     if (!route) return null;
     const nm = route.features?.[0]?.properties?.['distance_nm'];
@@ -48,11 +70,12 @@ export default function MapPage() {
     return distanceNm / speed;
   }, [distanceNm, form.speedKts]);
 
+  // ---------- UI handlers ----------
   const onChange = (e: React.ChangeEvent<HTMLInputElement>) =>
     setForm({ ...form, [e.target.name]: e.target.value });
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') plan(); // press Enter to plan
+    if (e.key === 'Enter') plan();
   };
 
   const swap = () => {
@@ -67,9 +90,9 @@ export default function MapPage() {
   };
 
   const presets: Array<{ label: string; o: [number, number]; d: [number, number] }> = [
-    { label: 'SF → LA', o: [37.7749, -122.4194], d: [34.0522, -118.2437] },
-    { label: 'NYC → Lisbon', o: [40.7128, -74.0060], d: [38.7223, -9.1393] },
-    { label: 'Tokyo → Seattle', o: [35.6762, 139.6503], d: [47.6062, -122.3321] },
+    { label: 'SF → LA',        o: [37.7749, -122.4194], d: [34.0522, -118.2437] },
+    { label: 'NYC → Lisbon',   o: [40.7128,  -74.0060], d: [38.7223,   -9.1393] },
+    { label: 'Tokyo → Seattle',o: [35.6762,  139.6503], d: [47.6062, -122.3321] },
   ];
 
   const applyPreset = (p: (typeof presets)[number]) => {
@@ -77,13 +100,13 @@ export default function MapPage() {
       ...f,
       originLat: p.o[0],
       originLon: p.o[1],
-      destLat: p.d[0],
-      destLon: p.d[1],
+      destLat:   p.d[0],
+      destLon:   p.d[1],
     }));
     setRoute(null);
   };
 
-  // Compute a bbox and fit the map to the route
+  // ---------- Map fit ----------
   const fitToRoute = (fc: FeatureCollection<LineString>) => {
     const coords = fc.features?.[0]?.geometry?.coordinates;
     if (!coords || coords.length < 2 || !mapRef.current) return;
@@ -104,6 +127,7 @@ export default function MapPage() {
     );
   };
 
+  // ---------- API call ----------
   const plan = async () => {
     setErr(null);
 
@@ -139,6 +163,7 @@ export default function MapPage() {
     }
   };
 
+  // ---------- Map layers ----------
   const routeLayer: LayerProps = {
     id: 'route',
     type: 'line',
@@ -160,9 +185,35 @@ export default function MapPage() {
     },
   };
 
+  // ---------- Initial map center ----------
   const centerLng = (asNum(form.originLon) + asNum(form.destLon)) / 2;
   const centerLat = (asNum(form.originLat) + asNum(form.destLat)) / 2;
 
+  // ---------- Share + Download handlers ----------
+  const copyShareLink = () => {
+    const params = new URLSearchParams({
+      oLat: String(form.originLat),
+      oLon: String(form.originLon),
+      dLat: String(form.destLat),
+      dLon: String(form.destLon),
+      spd:  String(form.speedKts),
+    });
+    const link = `${window.location.origin}/map?${params.toString()}`;
+    navigator.clipboard.writeText(link);
+  };
+
+  const downloadGeoJSON = () => {
+    if (!route) return;
+    const blob = new Blob([JSON.stringify(route, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'route.geojson';
+    a.click();
+    URL.revokeObjectURL(url);
+  };
+
+  // ---------- Render ----------
   return (
     <div className="min-h-screen text-white">
       {/* Top bar */}
@@ -197,7 +248,7 @@ export default function MapPage() {
         </Map>
 
         {/* Floating control panel */}
-        <div className="absolute top-6 left-6 w-[min(440px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
+        <div className="absolute top-6 left-6 w-[min(480px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
           <div className="flex items-center justify-between">
             <h2 className="font-semibold">Plan a route</h2>
             <button onClick={swap} className="btn btn-ghost">Swap ↕</button>
@@ -211,7 +262,7 @@ export default function MapPage() {
             <input className="input" name="destLon"   value={form.destLon}   onChange={onChange} onKeyDown={onKeyDown} placeholder="Destination lon" />
           </div>
 
-          <div className="flex items-center gap-2">
+          <div className="flex items-center gap-2 flex-wrap">
             <input className="input w-32" name="speedKts" value={form.speedKts} onChange={onChange} onKeyDown={onKeyDown} placeholder="Speed (kts)" />
             <button onClick={plan} disabled={loading} className="btn btn-primary">
               {loading ? (<><Spinner /><span className="ml-2">Planning…</span></>) : 'Plan route'}
@@ -223,6 +274,14 @@ export default function MapPage() {
               title="Fit to route"
             >
               Fit ↗
+            </button>
+
+            {/* NEW: Download + Share */}
+            <button onClick={downloadGeoJSON} disabled={!route} className="btn btn-ghost">
+              Download GeoJSON
+            </button>
+            <button onClick={copyShareLink} className="btn btn-ghost">
+              Share 🔗
             </button>
           </div>
 
