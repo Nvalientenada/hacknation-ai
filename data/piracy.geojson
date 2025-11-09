@@ -1,0 +1,16 @@
+{
+  "type": "FeatureCollection",
+  "features": [
+    { "type": "Feature",
+      "properties": { "source": "demo", "desc": "Gulf of Guinea incident" },
+      "geometry": { "type": "Point", "coordinates": [2.5, 4.5] } },
+
+    { "type": "Feature",
+      "properties": { "source": "demo", "desc": "Somalia/Bab el-Mandeb area" },
+      "geometry": { "type": "Point", "coordinates": [46.8, 12.5] } },
+
+    { "type": "Feature",
+      "properties": { "source": "demo", "desc": "Sulu-Celebes Sea" },
+      "geometry": { "type": "Point", "coordinates": [122.5, 6.0] } }
+  ]
+}

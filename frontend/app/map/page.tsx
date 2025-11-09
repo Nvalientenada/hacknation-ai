@@ -18,7 +18,11 @@ import type {
 import Spinner from '@/components/Spinner';
 import Toast from '@/components/Toast';
 import LayerToggles from '@/components/LayerToggles';
+import Waypoints, { type Waypoint as WP } from '@/components/Waypoints';
 import Link from 'next/link';
+
+import CitySearch from '@/components/CitySearch';
+import DraggablePanel from '@/components/DraggablePanel';
 
 const MAPBOX_TOKEN = process.env.NEXT_PUBLIC_MAPBOX_TOKEN!;
 const API_BASE = process.env.NEXT_PUBLIC_API_BASE!;
@@ -58,6 +62,8 @@ export default function MapPage() {
     speedKts: 14,
   });
 
+  const [waypoints, setWaypoints] = useState<WP[]>([]);
+
   const [route, setRoute] = useState<GeoJSONFC<LineString> | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -76,7 +82,7 @@ export default function MapPage() {
   const [ports, setPorts] = useState<PortsFC | null>(null);
   const [piracy, setPiracy] = useState<PiracyFC | null>(null);
 
-  // Hazard-avoid (A*) demo + weights
+  // Hazard-avoid (A*) + weights
   const [avoidOn, setAvoidOn] = useState(false);
   const [hazardPoly, setHazardPoly] = useState<GeoJSONFC<Polygon> | null>(null);
   const HAZARD_RADIUS_NM = 200;
@@ -98,6 +104,12 @@ export default function MapPage() {
     return typeof nm === 'number' ? nm : null;
   }, [route]);
 
+  const legsCount = useMemo(() => {
+    if (!route) return 0;
+    const n = route.features?.[0]?.properties?.['legs'];
+    return typeof n === 'number' ? n : 0;
+  }, [route]);
+
   const algo = useMemo(() => {
     if (!route) return null;
     const a = route.features?.[0]?.properties?.['algo'];
@@ -114,7 +126,7 @@ export default function MapPage() {
     setForm({ ...form, [e.target.name]: e.target.value });
 
   const onKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    if (e.key === 'Enter') plan();
+    if (e.key === 'Enter') void plan();
   };
 
   const swap = () => {
@@ -142,6 +154,7 @@ export default function MapPage() {
       destLat: p.d[0],
       destLon: p.d[1],
     }));
+    setWaypoints([]);
     setRoute(null);
   };
 
@@ -167,8 +180,13 @@ export default function MapPage() {
     );
   };
 
-  // --- Build a shareable URL from current form
+  // --- Build a shareable URL from current form (+ waypoints + weights)
   const makeShareUrl = () => {
+    const wp = waypoints
+      .filter((w) => w.lat !== '' && w.lon !== '')
+      .map((w) => `${w.lat}:${w.lon}`)
+      .join(';');
+
     const params = new URLSearchParams({
       oLat: String(form.originLat),
       oLon: String(form.originLon),
@@ -179,6 +197,7 @@ export default function MapPage() {
       sw: String(stormWeight),
       dp: String(depthPenalty),
       avoid: String(avoidOn ? 1 : 0),
+      wp, // waypoints "lat:lon;lat:lon"
     });
     return `${window.location.origin}/map?${params.toString()}`;
   };
@@ -261,61 +280,124 @@ export default function MapPage() {
     return fc;
   };
 
-  // --- Plan route (great-circle or A* avoid)
+  // --- Single leg planner (helper)
+  const planOneLeg = async (
+    a: { lat: number; lon: number },
+    b: { lat: number; lon: number },
+  ): Promise<GeoJSONFC<LineString>> => {
+    let url = `${API_BASE}/plan`;
+    let body: PlanPayload | AvoidPayload = { origin: a, destination: b };
+
+    if (avoidOn) {
+      const midLat = (a.lat + b.lat) / 2;
+      const midLon = (a.lon + b.lon) / 2;
+      setHazardPoly(makeHazardPolygon(midLat, midLon, HAZARD_RADIUS_NM));
+      url = `${API_BASE}/plan_avoid`;
+      body = {
+        origin: a,
+        destination: b,
+        hazards: [{ lat: midLat, lon: midLon, radius_nm: HAZARD_RADIUS_NM }],
+        grid_step_deg: 1.0,
+        penalty_nm: 400.0,
+        max_nodes: 200000,
+        piracy_weight: Number(piracyWeight),
+        storm_weight: Number(stormWeight),
+        depth_penalty_nm: Number(depthPenalty),
+      };
+    } else {
+      setHazardPoly(null);
+    }
+
+    const res = await fetch(url, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    if (!res.ok) throw new Error(`API ${res.status}`);
+    return (await res.json()) as GeoJSONFC<LineString>;
+  };
+
+  // --- Merge multiple legs into one LineString + aggregate properties
+  const mergeLegs = (legs: GeoJSONFC<LineString>[]): GeoJSONFC<LineString> => {
+    const coords: Position[] = [];
+    let totalNm = 0;
+    let anyAstar = false;
+
+    for (let i = 0; i < legs.length; i++) {
+      const feat = legs[i].features[0];
+      const c = feat.geometry.coordinates;
+      const dist = feat.properties?.['distance_nm'];
+      if (typeof dist === 'number') totalNm += dist;
+      if (feat.properties?.['algo'] === 'astar') anyAstar = true;
+
+      // avoid duplicating the first point of subsequent legs
+      if (i === 0) coords.push(...c);
+      else coords.push(...c.slice(1));
+    }
+
+    return {
+      type: 'FeatureCollection',
+      features: [
+        {
+          type: 'Feature',
+          geometry: { type: 'LineString', coordinates: coords },
+          properties: {
+            distance_nm: Number(totalNm.toFixed(2)),
+            algo: anyAstar ? 'astar_multi' : 'great_circle_multi',
+            legs: legs.length,
+          },
+        },
+      ],
+    };
+  };
+
+  // --- Multi-leg Plan (origin -> [waypoints...] -> destination)
   const plan = async () => {
     setErr(null);
 
+    // Validate inputs
     const oLat = asNum(form.originLat);
     const oLon = asNum(form.originLon);
     const dLat = asNum(form.destLat);
     const dLon = asNum(form.destLon);
-
     if (![oLat, dLat].every(validLat) || ![oLon, dLon].every(validLon)) {
       setErr('Please enter valid coordinates: lat ∈ [-90,90], lon ∈ [-180,180].');
       return;
     }
 
+    // Build legs: origin -> wp1 -> wp2 -> ... -> destination
+    const nodes: Array<{ lat: number; lon: number }> = [
+      { lat: oLat, lon: oLon },
+      ...waypoints
+        .map((w) => ({ lat: asNum(w.lat), lon: asNum(w.lon) }))
+        .filter((w) => validLat(w.lat) && validLon(w.lon)),
+      { lat: dLat, lon: dLon },
+    ];
+    if (nodes.length < 2) {
+      setErr('Not enough valid points to plan.');
+      return;
+    }
+
     setLoading(true);
     try {
-      let url = `${API_BASE}/plan`;
-      let body: PlanPayload | AvoidPayload = {
-        origin: { lat: oLat, lon: oLon },
-        destination: { lat: dLat, lon: dLon },
-      };
-
-      if (avoidOn) {
-        // Build a hazard circle centered at the midpoint
-        const midLat = (oLat + dLat) / 2;
-        const midLon = (oLon + dLon) / 2;
-        setHazardPoly(makeHazardPolygon(midLat, midLon, HAZARD_RADIUS_NM));
-        url = `${API_BASE}/plan_avoid`;
-        body = {
-          origin: { lat: oLat, lon: oLon },
-          destination: { lat: dLat, lon: dLon },
-          hazards: [{ lat: midLat, lon: midLon, radius_nm: HAZARD_RADIUS_NM }],
-          grid_step_deg: 1.0,
-          penalty_nm: 400.0,
-          max_nodes: 200000,
-          piracy_weight: Number(piracyWeight),
-          storm_weight: Number(stormWeight),
-          depth_penalty_nm: Number(depthPenalty),
-        };
-      } else {
-        setHazardPoly(null);
+      const legs: GeoJSONFC<LineString>[] = [];
+      for (let i = 0; i < nodes.length - 1; i++) {
+        const a = nodes[i];
+        const b = nodes[i + 1];
+        const leg = await planOneLeg(a, b);
+        legs.push(leg);
       }
+      const merged = mergeLegs(legs);
+      setRoute(merged);
+      fitToRoute(merged);
 
-      const res = await fetch(url, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(body),
-      });
-      if (!res.ok) throw new Error(`API ${res.status}`);
-      const data: GeoJSONFC<LineString> = await res.json();
-      setRoute(data);
-      fitToRoute(data);
-
-      // update address bar so the current URL is shareable
+      // update shareable URL (also encodes waypoints & weights)
       try {
+        const wp = waypoints
+          .filter((w) => w.lat !== '' && w.lon !== '')
+          .map((w) => `${w.lat}:${w.lon}`)
+          .join(';');
+
         const params = new URLSearchParams({
           oLat: String(form.originLat),
           oLon: String(form.originLon),
@@ -326,6 +408,7 @@ export default function MapPage() {
           sw: String(stormWeight),
           dp: String(depthPenalty),
           avoid: String(avoidOn ? 1 : 0),
+          wp,
         });
         const newUrl = `/map?${params.toString()}`;
         window.history.replaceState(null, '', newUrl);
@@ -338,7 +421,7 @@ export default function MapPage() {
     }
   };
 
-  // --- Preload from query (?oLat=..&...&avoid=1&pw=..&sw=..&dp=..)
+  // --- Preload from query (?…&wp=lat:lon;lat:lon&avoid=1&pw&sw&dp)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const qs = new URLSearchParams(window.location.search);
@@ -347,11 +430,24 @@ export default function MapPage() {
     const spd  = qs.get('spd');
     const avoid = qs.get('avoid');
     const pw = qs.get('pw'), sw = qs.get('sw'), dp = qs.get('dp');
+    const wp = qs.get('wp');
 
     setAvoidOn(avoid === '1');
     if (pw) setPiracyWeight(Number(pw));
     if (sw) setStormWeight(Number(sw));
     if (dp) setDepthPenalty(Number(dp));
+
+    if (wp) {
+      const parsed = wp
+        .split(';')
+        .map((pair) => pair.trim())
+        .filter(Boolean)
+        .map((pair) => {
+          const [lat, lon] = pair.split(':');
+          return { lat: Number(lat), lon: Number(lon) } as WP;
+        });
+      if (parsed.length) setWaypoints(parsed);
+    }
 
     if (oLat && oLon && dLat && dLon) {
       setForm((f) => ({
@@ -367,19 +463,20 @@ export default function MapPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // run once
 
-  // --- Fetch small demo layers from /public
-  useEffect(() => {
-    void (async () => {
-      try {
-        const p: PortsFC = await fetch('/data/ports-sample.geojson').then((r) => r.json());
-        setPorts(p);
-      } catch {}
-      try {
-        const pr: PiracyFC = await fetch('/data/piracy-sample.geojson').then((r) => r.json());
-        setPiracy(pr);
-      } catch {}
-    })();
-  }, []);
+  // --- Fetch layers (NOW piracy comes from backend)
+useEffect(() => {
+  void (async () => {
+    try {
+      const p: PortsFC = await fetch('/data/ports-sample.geojson').then((r) => r.json());
+      setPorts(p);
+    } catch {}
+    try {
+      const pr: PiracyFC = await fetch(`${API_BASE}/data/piracy`).then((r) => r.json());
+      setPiracy(pr);
+    } catch {}
+  })();
+}, [API_BASE]);
+
 
   // --- layers
   const routeLayer: LayerProps = {
@@ -388,9 +485,11 @@ export default function MapPage() {
     paint: {
       'line-color': [
         'case',
+        ['==', ['get', 'algo'], 'astar_multi'],
+        '#38bdf8',
         ['==', ['get', 'algo'], 'astar'],
-        '#38bdf8', // cyan if avoided
-        '#22c55e', // green otherwise
+        '#38bdf8',
+        '#22c55e',
       ],
       'line-width': 4,
       'line-opacity': 0.95,
@@ -403,6 +502,8 @@ export default function MapPage() {
     paint: {
       'line-color': [
         'case',
+        ['==', ['get', 'algo'], 'astar_multi'],
+        '#38bdf8',
         ['==', ['get', 'algo'], 'astar'],
         '#38bdf8',
         '#22c55e',
@@ -446,7 +547,7 @@ export default function MapPage() {
       </div>
 
       {/* Map container */}
-      <div className="relative h:[calc(100vh-64px)] h-[calc(100vh-64px)]">
+      <div className="relative h-[calc(100vh-64px)]">
         <Map
           ref={mapRef}
           initialViewState={{ longitude: centerLng, latitude: centerLat, zoom: 3 }}
@@ -506,7 +607,7 @@ export default function MapPage() {
               id="weather"
               type="raster"
               tiles={[
-                // Example placeholder; swap to NWS/StormGlass tile later.
+                // Example placeholder; swap to real provider later.
                 'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
               ]}
               tileSize={256}
@@ -566,86 +667,114 @@ export default function MapPage() {
           )}
         </Map>
 
-        {/* Floating control panel */}
-        <div className="absolute top-6 left-6 w-[min(560px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
-          <div className="flex items-center justify-between gap-3">
-            <h2 className="font-semibold">Plan a route</h2>
-            <button onClick={swap} className="btn btn-ghost">Swap ↕</button>
-          </div>
-
-          {/* Inputs */}
-          <div className="grid grid-cols-2 gap-2">
-            <input className="input" name="originLat" value={form.originLat} onChange={onChange} onKeyDown={onKeyDown} placeholder="Origin lat" />
-            <input className="input" name="originLon" value={form.originLon} onChange={onChange} onKeyDown={onKeyDown} placeholder="Origin lon" />
-            <input className="input" name="destLat"   value={form.destLat}   onChange={onChange} onKeyDown={onKeyDown} placeholder="Destination lat" />
-            <input className="input" name="destLon"   value={form.destLon}   onChange={onChange} onKeyDown={onKeyDown} placeholder="Destination lon" />
-          </div>
-
-          <div className="flex items-center gap-2 flex-wrap">
-            <input className="input w-32" name="speedKts" value={form.speedKts} onChange={onChange} onKeyDown={onKeyDown} placeholder="Speed (kts)" />
-            <button onClick={plan} disabled={loading} className="btn btn-primary">
-              {loading ? (<><Spinner /><span className="ml-2">Planning…</span></>) : 'Plan route'}
-            </button>
-            <button
-              onClick={() => route && fitToRoute(route)}
-              disabled={!route}
-              className="btn btn-ghost"
-              title="Fit to route"
-            >
-              Fit ↗
-            </button>
-          </div>
-
-          {/* Weights */}
-          <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
-            <div>
-              <label className="block text-xs mb-1">Piracy weight ({piracyWeight.toFixed(2)})</label>
-              <input type="range" min={0} max={1} step={0.1} value={piracyWeight} onChange={(e) => setPiracyWeight(Number(e.target.value))} />
+        {/* Draggable Floating control panel */}
+        <DraggablePanel initial={{ x: 24, y: 24 }}>
+          <div className="w-[min(620px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
+            <div className="flex items-center justify-between gap-3">
+              <h2 className="font-semibold">Plan a route</h2>
+              <button onClick={swap} className="btn btn-ghost">Swap ↕</button>
             </div>
-            <div>
-              <label className="block text-xs mb-1">Storm weight ({stormWeight.toFixed(2)})</label>
-              <input type="range" min={0} max={1} step={0.1} value={stormWeight} onChange={(e) => setStormWeight(Number(e.target.value))} />
-            </div>
-            <div>
-              <label className="block text-xs mb-1">Depth penalty nm ({depthPenalty.toFixed(1)})</label>
-              <input type="range" min={0} max={50} step={1} value={depthPenalty} onChange={(e) => setDepthPenalty(Number(e.target.value))} />
-            </div>
-          </div>
 
-          {/* Presets */}
-          <div className="flex items-center gap-2 flex-wrap">
-            {presets.map((p) => (
-              <button key={p.label} onClick={() => applyPreset(p)} className="btn btn-ghost text-xs px-2 py-1">
-                {p.label}
-              </button>
-            ))}
-          </div>
-
-          {/* Layer toggles */}
-          <LayerToggles value={layers} onChange={setLayers} />
-
-          {/* Avoidance toggle */}
-          <div className="mt-2">
-            <label className="flex items-center gap-2">
-              <input
-                type="checkbox"
-                checked={avoidOn}
-                onChange={() => setAvoidOn(v => !v)}
+            {/* NEW: City search boxes */}
+            <div className="grid grid-cols-1 gap-2">
+              <CitySearch
+                label="Origin city"
+                token={MAPBOX_TOKEN}
+                onPick={(lat: number, lon: number, label: string) => {
+                  setForm((f) => ({ ...f, originLat: lat, originLon: lon }));
+                  setToast(`Origin set to ${label}`);
+                  setRoute(null);
+                }}
               />
-              Avoid demo hazard (midpoint circle, {HAZARD_RADIUS_NM} nm)
-            </label>
-          </div>
+              <CitySearch
+                label="Destination city"
+                token={MAPBOX_TOKEN}
+                onPick={(lat: number, lon: number, label: string) => {
+                  setForm((f) => ({ ...f, destLat: lat, destLon: lon }));
+                  setToast(`Destination set to ${label}`);
+                  setRoute(null);
+                }}
+              />
+            </div>
 
-          {/* Stats */}
-          <div className="text-sm text-white/80 pt-2 border-t border-white/10 mt-2">
-            <div>Distance: {distanceNm ? `${distanceNm.toFixed(1)} nm` : '—'}</div>
-            <div>ETA: {etaHours ? `${etaHours.toFixed(1)} h @ ${asNum(form.speedKts)} kts` : '—'}</div>
-            <div>Algo: {algo ?? '—'}</div>
-            <div className="text-white/60">
-              Weights → piracy: {piracyWeight.toFixed(2)}, storm: {stormWeight.toFixed(2)}, depth nm: {depthPenalty.toFixed(1)}
+            {/* Manual overrides (keep for power users) */}
+            <div className="grid grid-cols-2 gap-2">
+              <input className="input" name="originLat" value={form.originLat} onChange={onChange} onKeyDown={onKeyDown} placeholder="Origin lat" />
+              <input className="input" name="originLon" value={form.originLon} onChange={onChange} onKeyDown={onKeyDown} placeholder="Origin lon" />
+              <input className="input" name="destLat"   value={form.destLat}   onChange={onChange} onKeyDown={onKeyDown} placeholder="Destination lat" />
+              <input className="input" name="destLon"   value={form.destLon}   onChange={onChange} onKeyDown={onKeyDown} placeholder="Destination lon" />
+            </div>
+
+            {/* Waypoints block */}
+            <Waypoints value={waypoints} onChange={setWaypoints} ports={ports} />
+
+            <div className="flex items-center gap-2 flex-wrap">
+              <input className="input w-32" name="speedKts" value={form.speedKts} onChange={onChange} onKeyDown={onKeyDown} placeholder="Speed (kts)" />
+              <button onClick={plan} disabled={loading} className="btn btn-primary">
+                {loading ? (<><Spinner /><span className="ml-2">Planning…</span></>) : 'Plan route'}
+              </button>
+              <button
+                onClick={() => route && fitToRoute(route)}
+                disabled={!route}
+                className="btn btn-ghost"
+                title="Fit to route"
+              >
+                Fit ↗
+              </button>
+            </div>
+
+            {/* Weights */}
+            <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
+              <div>
+                <label className="block text-xs mb-1">Piracy weight ({piracyWeight.toFixed(2)})</label>
+                <input type="range" min={0} max={1} step={0.1} value={piracyWeight} onChange={(e) => setPiracyWeight(Number(e.target.value))} />
+              </div>
+              <div>
+                <label className="block text-xs mb-1">Storm weight ({stormWeight.toFixed(2)})</label>
+                <input type="range" min={0} max={1} step={0.1} value={stormWeight} onChange={(e) => setStormWeight(Number(e.target.value))} />
+              </div>
+              <div>
+                <label className="block text-xs mb-1">Depth penalty nm ({depthPenalty.toFixed(1)})</label>
+                <input type="range" min={0} max={50} step={1} value={depthPenalty} onChange={(e) => setDepthPenalty(Number(e.target.value))} />
+              </div>
+            </div>
+
+            {/* Presets (optional quick fill) */}
+            <div className="flex items-center gap-2 flex-wrap">
+              {presets.map((p) => (
+                <button key={p.label} onClick={() => applyPreset(p)} className="btn btn-ghost text-xs px-2 py-1">
+                  {p.label}
+                </button>
+              ))}
+            </div>
+
+            {/* Layer toggles */}
+            <LayerToggles value={layers} onChange={setLayers} />
+
+            {/* Avoidance toggle */}
+            <div className="mt-2">
+              <label className="flex items-center gap-2">
+                <input
+                  type="checkbox"
+                  checked={avoidOn}
+                  onChange={() => setAvoidOn((v) => !v)}
+                />
+                Avoid demo hazard (midpoint circle, {HAZARD_RADIUS_NM} nm)
+              </label>
+            </div>
+
+            {/* Stats */}
+            <div className="text-sm text-white/80 pt-2 border-t border-white/10 mt-2">
+              <div>Distance: {distanceNm ? `${distanceNm.toFixed(1)} nm` : '—'}</div>
+              <div>ETA: {etaHours ? `${etaHours.toFixed(1)} h @ ${asNum(form.speedKts)} kts` : '—'}</div>
+              <div>Algo: {algo ?? '—'}</div>
+              <div>Legs: {legsCount || 1}</div>
+              <div className="text-white/60">
+                Weights → piracy: {piracyWeight.toFixed(2)}, storm: {stormWeight.toFixed(2)}, depth nm: {depthPenalty.toFixed(1)}
+              </div>
             </div>
           </div>
-        </div>
+        </DraggablePanel>
 
         {/* Loading overlay */}
         {loading && (

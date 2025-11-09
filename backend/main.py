@@ -1,21 +1,21 @@
 import os
-from typing import List, Tuple
-from math import radians, sin, cos, asin, atan2, sqrt
-from heapq import heappush, heappop
+from typing import List, Tuple, Dict, Iterable, Optional
+from math import radians, sin, cos, asin, atan2, sqrt, floor
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from heapq import heappush, heappop
+import json
 
-# ---- FastAPI app ----
+# ------------------------------------------------------------------------------
+# FastAPI app + CORS
+# ------------------------------------------------------------------------------
 app = FastAPI()
 
-# ---- CORS ----
-# Allow Vercel domain and localhost by default. You can customize with env.
 ALLOWED_ORIGINS = os.getenv("ALLOWED_ORIGINS", "")
 allow_origins = [o.strip() for o in ALLOWED_ORIGINS.split(",") if o.strip()]
 if not allow_origins:
-    # fallback for dev/demo
     allow_origins = ["*"]
 
 app.add_middleware(
@@ -26,13 +26,15 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# ---- Geo helpers ----
+# ------------------------------------------------------------------------------
+# Geo helpers
+# ------------------------------------------------------------------------------
 KM_TO_NM = 0.539957
 NM_TO_KM = 1.0 / KM_TO_NM
 R_KM = 6371.0088
+R_M  = R_KM * 1000.0
 
 def haversine_km(lat1, lon1, lat2, lon2):
-    """Great-circle distance between two lat/lon in KM."""
     φ1, λ1, φ2, λ2 = map(radians, [lat1, lon1, lat2, lon2])
     dφ = φ2 - φ1
     dλ = λ2 - λ1
@@ -41,7 +43,6 @@ def haversine_km(lat1, lon1, lat2, lon2):
     return R_KM * c
 
 def interpolate_geodesic(lat1, lon1, lat2, lon2, n=128) -> List[Tuple[float, float]]:
-    """Interpolate n points along great-circle from (lat1,lon1) to (lat2,lon2)."""
     φ1, λ1, φ2, λ2 = map(radians, [lat1, lon1, lat2, lon2])
     d = 2*asin(sqrt(sin((φ2-φ1)/2)**2 + cos(φ1)*cos(φ2)*sin((λ2-λ1)/2)**2))
     if d == 0:
@@ -56,10 +57,13 @@ def interpolate_geodesic(lat1, lon1, lat2, lon2, n=128) -> List[Tuple[float, flo
         z = A*sin(φ1) + B*sin(φ2)
         φi = atan2(z, sqrt(x*x + y*y))
         λi = atan2(y, x)
+        # normalize lon to [-180,180)
         points.append((((λi*180/3.141592653589793)+540)%360-180, φi*180/3.141592653589793))
     return points
 
-# ---- Models ----
+# ------------------------------------------------------------------------------
+# Models
+# ------------------------------------------------------------------------------
 class Waypoint(BaseModel):
     lat: float
     lon: float
@@ -80,15 +84,107 @@ class AvoidRequest(BaseModel):
     grid_step_deg: float = 1.0
     penalty_nm: float = 200.0
     max_nodes: int = 200000
-    # New weights
     piracy_weight: float = 0.0   # 0..1
-    storm_weight: float = 0.0    # 0..1
-    depth_penalty_nm: float = 0.0  # absolute nm added per step (demo)
+    storm_weight: float = 0.0    # placeholder (not used yet)
+    depth_penalty_nm: float = 0.0 # placeholder (not used yet)
 
-# ---- Endpoints ----
+# ------------------------------------------------------------------------------
+# Piracy index (lightweight grid for nearest search)
+# ------------------------------------------------------------------------------
+class PiracyIndex:
+    """
+    Very lightweight spatial index: bucket incidents into lat/lon grid cells.
+    Search nearest by checking the incident cell and its neighbors out to k rings.
+    """
+    def __init__(self, cell_deg: float = 1.0):
+        self.cell = cell_deg
+        self.points: List[Tuple[float,float,dict]] = []  # (lat, lon, props)
+        self.grid: Dict[Tuple[int,int], List[int]] = {}
+
+    def _key(self, lat: float, lon: float) -> Tuple[int,int]:
+        return (floor((lat + 90.0) / self.cell), floor((lon + 180.0) / self.cell))
+
+    def load_geojson(self, gj: dict):
+        pts: List[Tuple[float,float,dict]] = []
+        def add(lat: float, lon: float, props: dict):
+            idx = len(pts)
+            pts.append((lat, lon, props))
+            key = self._key(lat, lon)
+            self.grid.setdefault(key, []).append(idx)
+
+        if gj.get("type") == "FeatureCollection":
+            for feat in gj.get("features", []):
+                geom = feat.get("geometry", {})
+                props = feat.get("properties", {}) or {}
+                gtype = geom.get("type")
+                if gtype == "Point":
+                    lon, lat = geom.get("coordinates", [None, None])[:2]
+                    if lat is not None and lon is not None:
+                        add(lat, lon, props)
+                elif gtype == "MultiPoint":
+                    for lon, lat in geom.get("coordinates", []):
+                        add(lat, lon, props)
+                # if Polygon risk zones are present, we just expose them; distance is based on points for now
+        self.points = pts
+
+    def nearest_nm(self, lat: float, lon: float, max_rings: int = 3) -> Optional[float]:
+        if not self.points:
+            return None
+        base_key = self._key(lat, lon)
+        best_nm: Optional[float] = None
+
+        for ring in range(max_rings + 1):
+            # iterate cells in the square ring around base_key
+            for dy in range(-ring, ring + 1):
+                for dx in range(-ring, ring + 1):
+                    if ring > 0 and abs(dy) < ring and abs(dx) < ring:
+                        continue  # only border of the ring
+                    cell = (base_key[0] + dy, base_key[1] + dx)
+                    idxs = self.grid.get(cell)
+                    if not idxs:
+                        continue
+                    for i in idxs:
+                        plat, plon, _ = self.points[i]
+                        d_km = haversine_km(lat, lon, plat, plon)
+                        d_nm = d_km * KM_TO_NM
+                        if best_nm is None or d_nm < best_nm:
+                            best_nm = d_nm
+            if best_nm is not None:
+                return best_nm
+        return None
+
+# Global piracy index + data payload served to frontend
+PIRACY_PATH = os.getenv("DATA_PIRACY_PATH", "data/piracy.geojson")
+piracy_index = PiracyIndex(cell_deg=1.0)
+piracy_geojson_cache: Optional[dict] = None
+
+def _load_piracy_from_disk() -> dict:
+    with open(PIRACY_PATH, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+def ensure_piracy_loaded():
+    global piracy_geojson_cache
+    if piracy_geojson_cache is None:
+        try:
+            gj = _load_piracy_from_disk()
+            piracy_index.load_geojson(gj)
+            piracy_geojson_cache = gj
+            print(f"[piracy] loaded {len(piracy_index.points)} point incidents from {PIRACY_PATH}")
+        except Exception as e:
+            piracy_geojson_cache = {"type":"FeatureCollection","features":[]}
+            print(f"[piracy] failed to load ({e}); continuing with empty set")
+
+# ------------------------------------------------------------------------------
+# Endpoints
+# ------------------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
+
+@app.get("/data/piracy")
+def get_piracy():
+    ensure_piracy_loaded()
+    return piracy_geojson_cache
 
 @app.post("/plan")
 def plan(req: PlanRequest):
@@ -99,14 +195,11 @@ def plan(req: PlanRequest):
     feature = {
         "type": "Feature",
         "geometry": {"type": "LineString", "coordinates": pts},
-        "properties": {
-            "distance_nm": round(dist_nm, 2),
-            "algo": "great_circle",
-        },
+        "properties": {"distance_nm": round(dist_nm, 2), "algo": "great_circle"},
     }
     return {"type": "FeatureCollection", "features": [feature]}
 
-# ---- A* Avoid Routing ----
+# ---- A* Avoid Routing with piracy proximity penalty ----
 def inside_hazard(lat: float, lon: float, hazards: List[HazardCircle]) -> bool:
     for h in hazards:
         d_km = haversine_km(lat, lon, h.lat, h.lon)
@@ -114,43 +207,47 @@ def inside_hazard(lat: float, lon: float, hazards: List[HazardCircle]) -> bool:
             return True
     return False
 
-def a_star_route(
-    o: Waypoint,
-    d: Waypoint,
-    step=1.0,
-    hazards: List[HazardCircle] = [],
-    penalty_nm: float = 200.0,
-    max_nodes: int = 200000,
-    piracy_weight: float = 0.0,
-    storm_weight: float = 0.0,
-    depth_penalty_nm: float = 0.0,
-):
+def piracy_penalty_nm(lat: float, lon: float, weight: float) -> float:
+    """Penalty grows when close to nearest piracy incident.
+    Within 100 nm: linear penalty up to 500 nm * weight.
+    Beyond 300 nm: ~0. Between 100..300 nm: taper to 0.
     """
-    A* on a lat/lon grid. Edge cost =
-      base distance (nm)
-      + piracy penalty (if inside hazard circle) scaled by piracy_weight
-      + storm penalty (demo: tropical band) scaled by storm_weight
-      + depth penalty (demo: constant tiny nm)
-    """
+    if weight <= 0.0:
+        return 0.0
+    ensure_piracy_loaded()
+    d = piracy_index.nearest_nm(lat, lon)
+    if d is None:
+        return 0.0
+
+    # piecewise linear penalty shape (hackathon-friendly and tunable)
+    if d <= 100:
+        base = 500.0 * (1.0 - (d / 100.0))  # 0..500
+    elif d <= 300:
+        base = 100.0 * (1.0 - (d - 100.0) / 200.0)  # 100→0
+    else:
+        base = 0.0
+    return base * max(0.0, min(1.0, weight))
+
+def a_star_route(o: Waypoint, d: Waypoint, step=1.0,
+                 hazards: List[HazardCircle]=[],
+                 penalty_nm: float = 200.0,
+                 max_nodes: int = 200000,
+                 piracy_weight: float = 0.0) -> Tuple[List[Tuple[float,float]], float, int, bool]:
+    """A* on a lat/lon grid. Edge cost = distance (nm) + penalties."""
     def snap(x, s):
         return round(x / s) * s
 
     start = (snap(o.lat, step), snap(o.lon, step))
     goal  = (snap(d.lat, step), snap(d.lon, step))
 
-    dirs = [
-        (0, step), (0, -step),
-        (step, 0), (-step, 0),
-        (step, step), (step, -step), (-step, step), (-step, -step)
-    ]
-
+    dirs = [(0, step), (0, -step), (step, 0), (-step, 0), (step, step), (step, -step), (-step, step), (-step, -step)]
     def h(n):
         return haversine_km(n[0], n[1], goal[0], goal[1]) * KM_TO_NM
 
     openq = []
     heappush(openq, (0 + h(start), 0.0, start, None))
-    came = {}
-    bestg = {start: 0.0}
+    came: Dict[Tuple[float,float], Optional[Tuple[float,float]]] = {}
+    bestg: Dict[Tuple[float,float], float] = {start: 0.0}
     visited = 0
 
     while openq:
@@ -166,8 +263,6 @@ def a_star_route(
 
         for dy, dx in dirs:
             nb = (cur[0] + dy, cur[1] + dx)
-
-            # Latitude bounds & wrap longitude
             if nb[0] < -89.5 or nb[0] > 89.5:
                 continue
             lon = nb[1]
@@ -176,22 +271,12 @@ def a_star_route(
             nb = (nb[0], lon)
 
             seg_nm = haversine_km(cur[0], cur[1], nb[0], nb[1]) * KM_TO_NM
-            cost = seg_nm
 
-            # Piracy penalty (inside circle → apply scaled penalty)
-            if piracy_weight > 0 and inside_hazard(nb[0], nb[1], hazards):
-                cost += penalty_nm * piracy_weight
+            # penalties
+            p_demo = penalty_nm if inside_hazard(nb[0], nb[1], hazards) else 0.0
+            p_piracy = piracy_penalty_nm(nb[0], nb[1], piracy_weight)
 
-            # Storm penalty (demo heuristic: tropical band)
-            # If in 10°–25° absolute latitude, apply a smaller penalty.
-            if storm_weight > 0:
-                if 10 <= abs(nb[0]) <= 25:
-                    cost += penalty_nm * 0.15 * storm_weight
-
-            # Depth penalty (demo): small constant to illustrate trade-off
-            if depth_penalty_nm > 0:
-                cost += depth_penalty_nm * 0.01
-
+            cost = seg_nm + p_demo + p_piracy
             ng = g + cost
             if nb not in bestg or ng < bestg[nb]:
                 bestg[nb] = ng
@@ -199,7 +284,6 @@ def a_star_route(
 
     # reconstruct
     if goal not in came:
-        # fallback to great-circle
         pts = interpolate_geodesic(o.lat, o.lon, d.lat, d.lon, n=128)
         dist_nm = haversine_km(o.lat, o.lon, d.lat, d.lon) * KM_TO_NM
         return pts, dist_nm, visited, False
@@ -211,7 +295,6 @@ def a_star_route(
         cur = came[cur]
     path.reverse()
 
-    # length
     total_nm = 0.0
     coords = []
     for i, node in enumerate(path):
@@ -230,8 +313,6 @@ def plan_avoid(req: AvoidRequest):
         penalty_nm=req.penalty_nm,
         max_nodes=req.max_nodes,
         piracy_weight=req.piracy_weight,
-        storm_weight=req.storm_weight,
-        depth_penalty_nm=req.depth_penalty_nm,
     )
     feature = {
         "type": "Feature",
@@ -242,9 +323,6 @@ def plan_avoid(req: AvoidRequest):
             "visited": visited,
             "grid_step_deg": req.grid_step_deg,
             "hazards": len(req.hazards),
-            "piracy_weight": req.piracy_weight,
-            "storm_weight": req.storm_weight,
-            "depth_penalty_nm": req.depth_penalty_nm,
         },
     }
     return {"type": "FeatureCollection", "features": [feature]}
