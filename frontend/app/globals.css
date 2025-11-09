@@ -1,26 +1,57 @@
 @import "tailwindcss";
 
 :root {
-  --background: #ffffff;
-  --foreground: #171717;
+  --bg: #0b1020;
 }
 
-@theme inline {
-  --color-background: var(--background);
-  --color-foreground: var(--foreground);
-  --font-sans: var(--font-geist-sans);
-  --font-mono: var(--font-geist-mono);
+html, body {
+  height: 100%;
+  background:
+    radial-gradient(1000px 600px at 30% -10%, #173053 10%, transparent 60%),
+    radial-gradient(1200px 700px at 90% 10%, #13243f 10%, transparent 60%),
+    var(--bg);
 }
 
-@media (prefers-color-scheme: dark) {
-  :root {
-    --background: #0a0a0a;
-    --foreground: #ededed;
-  }
+.glass {
+  @apply bg-white/5 backdrop-blur-lg border border-white/10 rounded-2xl;
 }
 
-body {
-  background: var(--background);
-  color: var(--foreground);
-  font-family: Arial, Helvetica, sans-serif;
+.input {
+  @apply bg-white/5 border border-white/10 rounded-lg px-3 py-2 text-sm text-white placeholder-white/50 focus:outline-none focus:ring-2 focus:ring-emerald-400/40;
+}
+
+.btn {
+  @apply inline-flex items-center justify-center rounded-lg px-3 py-2 text-sm font-medium transition;
+}
+
+.btn-primary {
+  @apply bg-emerald-500 hover:bg-emerald-600 text-white disabled:opacity-50 disabled:cursor-not-allowed;
+}
+
+.btn-ghost {
+  @apply bg-white/5 hover:bg-white/10 text-white;
+}
+
+.badge {
+  @apply inline-flex items-center gap-1 rounded-full bg-white/10 px-2 py-1 text-xs text-white/80;
+}
+/* --- micro polish --- */
+
+@keyframes fadeUp {
+  from { opacity: 0; transform: translateY(6px); }
+  to   { opacity: 1; transform: translateY(0); }
+}
+.fade-up { animation: fadeUp 420ms ease-out both; }
+
+.focus-ring {
+  @apply outline-none ring-2 ring-emerald-400/40;
+}
+.btn:hover { transform: translateY(-1px); }
+.btn:active { transform: translateY(0); }
+
+/* small toast baseline */
+.toast {
+  @apply fixed left-1/2 -translate-x-1/2 bottom-6 px-4 py-2 rounded-lg text-sm text-white shadow-lg;
+  background: rgba(20, 20, 24, 0.9);
+  border: 1px solid rgba(255,255,255,0.08);
 }
