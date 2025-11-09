@@ -80,6 +80,10 @@ class AvoidRequest(BaseModel):
     grid_step_deg: float = 1.0
     penalty_nm: float = 200.0
     max_nodes: int = 200000
+    # New weights
+    piracy_weight: float = 0.0   # 0..1
+    storm_weight: float = 0.0    # 0..1
+    depth_penalty_nm: float = 0.0  # absolute nm added per step (demo)
 
 # ---- Endpoints ----
 @app.get("/health")
@@ -95,7 +99,10 @@ def plan(req: PlanRequest):
     feature = {
         "type": "Feature",
         "geometry": {"type": "LineString", "coordinates": pts},
-        "properties": {"distance_nm": round(dist_nm, 2), "algo": "great_circle"},
+        "properties": {
+            "distance_nm": round(dist_nm, 2),
+            "algo": "great_circle",
+        },
     }
     return {"type": "FeatureCollection", "features": [feature]}
 
@@ -107,15 +114,36 @@ def inside_hazard(lat: float, lon: float, hazards: List[HazardCircle]) -> bool:
             return True
     return False
 
-def a_star_route(o: Waypoint, d: Waypoint, step=1.0, hazards=[], penalty_nm=200.0, max_nodes=200000):
-    """A* on a lat/lon grid. Edge cost = distance (nm) + penalty if node inside hazard."""
+def a_star_route(
+    o: Waypoint,
+    d: Waypoint,
+    step=1.0,
+    hazards: List[HazardCircle] = [],
+    penalty_nm: float = 200.0,
+    max_nodes: int = 200000,
+    piracy_weight: float = 0.0,
+    storm_weight: float = 0.0,
+    depth_penalty_nm: float = 0.0,
+):
+    """
+    A* on a lat/lon grid. Edge cost =
+      base distance (nm)
+      + piracy penalty (if inside hazard circle) scaled by piracy_weight
+      + storm penalty (demo: tropical band) scaled by storm_weight
+      + depth penalty (demo: constant tiny nm)
+    """
     def snap(x, s):
         return round(x / s) * s
 
     start = (snap(o.lat, step), snap(o.lon, step))
     goal  = (snap(d.lat, step), snap(d.lon, step))
 
-    dirs = [(0, step), (0, -step), (step, 0), (-step, 0), (step, step), (step, -step), (-step, step), (-step, -step)]
+    dirs = [
+        (0, step), (0, -step),
+        (step, 0), (-step, 0),
+        (step, step), (step, -step), (-step, step), (-step, -step)
+    ]
+
     def h(n):
         return haversine_km(n[0], n[1], goal[0], goal[1]) * KM_TO_NM
 
@@ -138,6 +166,8 @@ def a_star_route(o: Waypoint, d: Waypoint, step=1.0, hazards=[], penalty_nm=200.
 
         for dy, dx in dirs:
             nb = (cur[0] + dy, cur[1] + dx)
+
+            # Latitude bounds & wrap longitude
             if nb[0] < -89.5 or nb[0] > 89.5:
                 continue
             lon = nb[1]
@@ -146,7 +176,22 @@ def a_star_route(o: Waypoint, d: Waypoint, step=1.0, hazards=[], penalty_nm=200.
             nb = (nb[0], lon)
 
             seg_nm = haversine_km(cur[0], cur[1], nb[0], nb[1]) * KM_TO_NM
-            cost = seg_nm + (penalty_nm if inside_hazard(nb[0], nb[1], hazards) else 0.0)
+            cost = seg_nm
+
+            # Piracy penalty (inside circle → apply scaled penalty)
+            if piracy_weight > 0 and inside_hazard(nb[0], nb[1], hazards):
+                cost += penalty_nm * piracy_weight
+
+            # Storm penalty (demo heuristic: tropical band)
+            # If in 10°–25° absolute latitude, apply a smaller penalty.
+            if storm_weight > 0:
+                if 10 <= abs(nb[0]) <= 25:
+                    cost += penalty_nm * 0.15 * storm_weight
+
+            # Depth penalty (demo): small constant to illustrate trade-off
+            if depth_penalty_nm > 0:
+                cost += depth_penalty_nm * 0.01
+
             ng = g + cost
             if nb not in bestg or ng < bestg[nb]:
                 bestg[nb] = ng
@@ -184,6 +229,9 @@ def plan_avoid(req: AvoidRequest):
         hazards=req.hazards,
         penalty_nm=req.penalty_nm,
         max_nodes=req.max_nodes,
+        piracy_weight=req.piracy_weight,
+        storm_weight=req.storm_weight,
+        depth_penalty_nm=req.depth_penalty_nm,
     )
     feature = {
         "type": "Feature",
@@ -194,6 +242,9 @@ def plan_avoid(req: AvoidRequest):
             "visited": visited,
             "grid_step_deg": req.grid_step_deg,
             "hazards": len(req.hazards),
+            "piracy_weight": req.piracy_weight,
+            "storm_weight": req.storm_weight,
+            "depth_penalty_nm": req.depth_penalty_nm,
         },
     }
     return {"type": "FeatureCollection", "features": [feature]}

@@ -44,6 +44,9 @@ type AvoidPayload = PlanPayload & {
   grid_step_deg: number;
   penalty_nm: number;
   max_nodes: number;
+  piracy_weight: number;
+  storm_weight: number;
+  depth_penalty_nm: number;
 };
 
 export default function MapPage() {
@@ -73,10 +76,14 @@ export default function MapPage() {
   const [ports, setPorts] = useState<PortsFC | null>(null);
   const [piracy, setPiracy] = useState<PiracyFC | null>(null);
 
-  // Hazard-avoid (A*) demo
+  // Hazard-avoid (A*) demo + weights
   const [avoidOn, setAvoidOn] = useState(false);
   const [hazardPoly, setHazardPoly] = useState<GeoJSONFC<Polygon> | null>(null);
   const HAZARD_RADIUS_NM = 200;
+
+  const [piracyWeight, setPiracyWeight] = useState(0.8); // 0..1
+  const [stormWeight, setStormWeight] = useState(0.0);   // 0..1
+  const [depthPenalty, setDepthPenalty] = useState(0.0); // absolute nm (demo)
 
   const mapRef = useRef<MapRef | null>(null);
 
@@ -168,6 +175,10 @@ export default function MapPage() {
       dLat: String(form.destLat),
       dLon: String(form.destLon),
       spd: String(form.speedKts),
+      pw: String(piracyWeight),
+      sw: String(stormWeight),
+      dp: String(depthPenalty),
+      avoid: String(avoidOn ? 1 : 0),
     });
     return `${window.location.origin}/map?${params.toString()}`;
   };
@@ -285,6 +296,9 @@ export default function MapPage() {
           grid_step_deg: 1.0,
           penalty_nm: 400.0,
           max_nodes: 200000,
+          piracy_weight: Number(piracyWeight),
+          storm_weight: Number(stormWeight),
+          depth_penalty_nm: Number(depthPenalty),
         };
       } else {
         setHazardPoly(null);
@@ -308,6 +322,10 @@ export default function MapPage() {
           dLat: String(form.destLat),
           dLon: String(form.destLon),
           spd: String(form.speedKts),
+          pw: String(piracyWeight),
+          sw: String(stormWeight),
+          dp: String(depthPenalty),
+          avoid: String(avoidOn ? 1 : 0),
         });
         const newUrl = `/map?${params.toString()}`;
         window.history.replaceState(null, '', newUrl);
@@ -320,13 +338,20 @@ export default function MapPage() {
     }
   };
 
-  // --- Preload from query (?oLat=..&oLon=..&dLat=..&dLon=..&spd=..)
+  // --- Preload from query (?oLat=..&...&avoid=1&pw=..&sw=..&dp=..)
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const qs = new URLSearchParams(window.location.search);
     const oLat = qs.get('oLat'), oLon = qs.get('oLon');
     const dLat = qs.get('dLat'), dLon = qs.get('dLon');
     const spd  = qs.get('spd');
+    const avoid = qs.get('avoid');
+    const pw = qs.get('pw'), sw = qs.get('sw'), dp = qs.get('dp');
+
+    setAvoidOn(avoid === '1');
+    if (pw) setPiracyWeight(Number(pw));
+    if (sw) setStormWeight(Number(sw));
+    if (dp) setDepthPenalty(Number(dp));
 
     if (oLat && oLon && dLat && dLon) {
       setForm((f) => ({
@@ -421,7 +446,7 @@ export default function MapPage() {
       </div>
 
       {/* Map container */}
-      <div className="relative h-[calc(100vh-64px)]">
+      <div className="relative h:[calc(100vh-64px)] h-[calc(100vh-64px)]">
         <Map
           ref={mapRef}
           initialViewState={{ longitude: centerLng, latitude: centerLat, zoom: 3 }}
@@ -542,7 +567,7 @@ export default function MapPage() {
         </Map>
 
         {/* Floating control panel */}
-        <div className="absolute top-6 left-6 w-[min(520px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
+        <div className="absolute top-6 left-6 w-[min(560px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
           <div className="flex items-center justify-between gap-3">
             <h2 className="font-semibold">Plan a route</h2>
             <button onClick={swap} className="btn btn-ghost">Swap ↕</button>
@@ -571,6 +596,22 @@ export default function MapPage() {
             </button>
           </div>
 
+          {/* Weights */}
+          <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
+            <div>
+              <label className="block text-xs mb-1">Piracy weight ({piracyWeight.toFixed(2)})</label>
+              <input type="range" min={0} max={1} step={0.1} value={piracyWeight} onChange={(e) => setPiracyWeight(Number(e.target.value))} />
+            </div>
+            <div>
+              <label className="block text-xs mb-1">Storm weight ({stormWeight.toFixed(2)})</label>
+              <input type="range" min={0} max={1} step={0.1} value={stormWeight} onChange={(e) => setStormWeight(Number(e.target.value))} />
+            </div>
+            <div>
+              <label className="block text-xs mb-1">Depth penalty nm ({depthPenalty.toFixed(1)})</label>
+              <input type="range" min={0} max={50} step={1} value={depthPenalty} onChange={(e) => setDepthPenalty(Number(e.target.value))} />
+            </div>
+          </div>
+
           {/* Presets */}
           <div className="flex items-center gap-2 flex-wrap">
             {presets.map((p) => (
@@ -578,13 +619,6 @@ export default function MapPage() {
                 {p.label}
               </button>
             ))}
-          </div>
-
-          {/* Stats */}
-          <div className="text-sm text-white/80">
-            <div>Distance: {distanceNm ? `${distanceNm.toFixed(1)} nm` : '—'}</div>
-            <div>ETA: {etaHours ? `${etaHours.toFixed(1)} h @ ${asNum(form.speedKts)} kts` : '—'}</div>
-            <div>Algo: {algo ?? '—'}</div>
           </div>
 
           {/* Layer toggles */}
@@ -600,6 +634,16 @@ export default function MapPage() {
               />
               Avoid demo hazard (midpoint circle, {HAZARD_RADIUS_NM} nm)
             </label>
+          </div>
+
+          {/* Stats */}
+          <div className="text-sm text-white/80 pt-2 border-t border-white/10 mt-2">
+            <div>Distance: {distanceNm ? `${distanceNm.toFixed(1)} nm` : '—'}</div>
+            <div>ETA: {etaHours ? `${etaHours.toFixed(1)} h @ ${asNum(form.speedKts)} kts` : '—'}</div>
+            <div>Algo: {algo ?? '—'}</div>
+            <div className="text-white/60">
+              Weights → piracy: {piracyWeight.toFixed(2)}, storm: {stormWeight.toFixed(2)}, depth nm: {depthPenalty.toFixed(1)}
+            </div>
           </div>
         </div>
 
