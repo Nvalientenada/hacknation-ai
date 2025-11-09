@@ -14,13 +14,13 @@ import type {
   Point,
   Polygon,
   Position,
+  Feature,
 } from 'geojson';
 import Spinner from '@/components/Spinner';
 import Toast from '@/components/Toast';
 import LayerToggles from '@/components/LayerToggles';
 import Waypoints, { type Waypoint as WP } from '@/components/Waypoints';
 import Link from 'next/link';
-
 import CitySearch from '@/components/CitySearch';
 import DraggablePanel from '@/components/DraggablePanel';
 
@@ -37,6 +37,7 @@ type FormState = {
 
 type PortsFC = GeoJSONFC<Point, { name: string }>;
 type PiracyFC = GeoJSONFC<Polygon | Point, { risk?: string }>;
+type StormFC = GeoJSONFC<Point, { name?: string; basin?: string; id?: string }>;
 
 type PlanPayload = {
   origin: { lat: number; lon: number };
@@ -77,10 +78,11 @@ export default function MapPage() {
     ports: true,
     piracy: true,
     bathy: true,
-    weather: false,
+    weather: true, // storms overlay
   });
   const [ports, setPorts] = useState<PortsFC | null>(null);
   const [piracy, setPiracy] = useState<PiracyFC | null>(null);
+  const [storms, setStorms] = useState<StormFC | null>(null);
 
   // Hazard-avoid (A*) + weights
   const [avoidOn, setAvoidOn] = useState(false);
@@ -89,7 +91,7 @@ export default function MapPage() {
 
   const [piracyWeight, setPiracyWeight] = useState(0.8); // 0..1
   const [stormWeight, setStormWeight] = useState(0.0);   // 0..1
-  const [depthPenalty, setDepthPenalty] = useState(0.0); // absolute nm (demo)
+  const [depthPenalty, setDepthPenalty] = useState(0.0); // nm
 
   const mapRef = useRef<MapRef | null>(null);
 
@@ -202,7 +204,7 @@ export default function MapPage() {
     return `${window.location.origin}/map?${params.toString()}`;
   };
 
-  // --- Share handler (Web Share → clipboard → textarea fallback)
+  // --- Share handler
   const shareLink = async () => {
     try {
       setShareBusy(true);
@@ -242,7 +244,6 @@ export default function MapPage() {
   const NM_TO_M = 1852;
   const R = 6371000; // meters
 
-  // destination point given start lat/lon (deg), bearing (deg), distance (nm)
   const destination = (lat: number, lon: number, brgDeg: number, distNm: number) => {
     const brg = toRad(brgDeg);
     const d = (distNm * NM_TO_M) / R;
@@ -257,7 +258,7 @@ export default function MapPage() {
     const x = cosD - sinφ1 * sinφ2;
     const λ2 = λ1 + Math.atan2(y, x);
 
-    return { lat: toDeg(φ2), lon: ((toDeg(λ2) + 540) % 360) - 180 }; // normalize lon
+    return { lat: toDeg(φ2), lon: ((toDeg(λ2) + 540) % 360) - 180 };
   };
 
   const makeHazardPolygon = (lat: number, lon: number, radiusNm: number, steps = 128) => {
@@ -330,7 +331,6 @@ export default function MapPage() {
       if (typeof dist === 'number') totalNm += dist;
       if (feat.properties?.['algo'] === 'astar') anyAstar = true;
 
-      // avoid duplicating the first point of subsequent legs
       if (i === 0) coords.push(...c);
       else coords.push(...c.slice(1));
     }
@@ -351,11 +351,10 @@ export default function MapPage() {
     };
   };
 
-  // --- Multi-leg Plan (origin -> [waypoints...] -> destination)
+  // --- Multi-leg Plan
   const plan = async () => {
     setErr(null);
 
-    // Validate inputs
     const oLat = asNum(form.originLat);
     const oLon = asNum(form.originLon);
     const dLat = asNum(form.destLat);
@@ -365,7 +364,6 @@ export default function MapPage() {
       return;
     }
 
-    // Build legs: origin -> wp1 -> wp2 -> ... -> destination
     const nodes: Array<{ lat: number; lon: number }> = [
       { lat: oLat, lon: oLon },
       ...waypoints
@@ -391,7 +389,6 @@ export default function MapPage() {
       setRoute(merged);
       fitToRoute(merged);
 
-      // update shareable URL (also encodes waypoints & weights)
       try {
         const wp = waypoints
           .filter((w) => w.lat !== '' && w.lon !== '')
@@ -421,7 +418,7 @@ export default function MapPage() {
     }
   };
 
-  // --- Preload from query (?…&wp=lat:lon;lat:lon&avoid=1&pw&sw&dp)
+  // --- Preload from query
   useEffect(() => {
     if (typeof window === 'undefined') return;
     const qs = new URLSearchParams(window.location.search);
@@ -463,20 +460,102 @@ export default function MapPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []); // run once
 
-  // --- Fetch layers (NOW piracy comes from backend)
-useEffect(() => {
-  void (async () => {
-    try {
-      const p: PortsFC = await fetch('/data/ports-sample.geojson').then((r) => r.json());
-      setPorts(p);
-    } catch {}
-    try {
-      const pr: PiracyFC = await fetch(`${API_BASE}/data/piracy`).then((r) => r.json());
-      setPiracy(pr);
-    } catch {}
-  })();
-}, [API_BASE]);
+  // ---------- Storm parsing helpers (SAFE, no undefined access) ----------
+  function parseLat(val: unknown): number | null {
+    if (typeof val === 'number' && Number.isFinite(val)) return val;
+    if (typeof val === 'string') {
+      const s = val.trim().toUpperCase();
+      const m = s.match(/([-+]?\d+(?:\.\d+)?)([NS])?/);
+      if (!m) return null;
+      const n = parseFloat(m[1]);
+      return s.includes('S') ? -n : n;
+    }
+    return null;
+  }
+  function parseLon(val: unknown): number | null {
+    if (typeof val === 'number' && Number.isFinite(val)) return val;
+    if (typeof val === 'string') {
+      const s = val.trim().toUpperCase();
+      const m = s.match(/([-+]?\d+(?:\.\d+)?)([EW])?/);
+      if (!m) return null;
+      const n = parseFloat(m[1]);
+      return s.includes('W') ? -n : n;
+    }
+    return null;
+  }
+  function parsePosition(pos?: string): { lat: number | null; lon: number | null } {
+    if (typeof pos !== 'string') return { lat: null, lon: null };
+    const parts = pos.split(',').map((p) => p.trim());
+    const plat = parts[0] ?? '';
+    const plon = parts[1] ?? '';
+    return { lat: parseLat(plat), lon: parseLon(plon) };
+  }
 
+  function normalizeStorms(raw: unknown): StormFC {
+    const features: Feature<Point, { name?: string; basin?: string; id?: string }>[] = [];
+
+    const pushIfValid = (name?: string, basin?: string, id?: string, lat?: number | null, lon?: number | null) => {
+      if (typeof lat === 'number' && typeof lon === 'number') {
+        features.push({
+          type: 'Feature',
+          properties: { name, basin, id },
+          geometry: { type: 'Point', coordinates: [lon, lat] },
+        });
+      }
+    };
+
+    if (Array.isArray(raw)) {
+      for (const it of raw) {
+        const anyIt = it as any;
+        const name = anyIt.name ?? anyIt.stormName;
+        const basin = anyIt.basin;
+        const id = anyIt.id ?? anyIt.stormId;
+
+        let lat = parseLat(anyIt.lat);
+        let lon = parseLon(anyIt.lon);
+
+        if (lat == null || lon == null) {
+          const { lat: pLat, lon: pLon } = parsePosition(anyIt.position);
+          if (lat == null) lat = pLat;
+          if (lon == null) lon = pLon;
+        }
+
+        pushIfValid(name, basin, id, lat, lon);
+      }
+    } else if (raw && typeof raw === 'object') {
+      const anyRaw = raw as any;
+      const arr = anyRaw.storms ?? anyRaw.activeStorms ?? anyRaw.features;
+      if (Array.isArray(arr)) {
+        return normalizeStorms(arr);
+      }
+      const maybe = raw as Partial<StormFC>;
+      if (maybe.type === 'FeatureCollection' && Array.isArray(maybe.features)) {
+        return maybe as StormFC;
+      }
+    }
+
+    return { type: 'FeatureCollection', features };
+  }
+  // ----------------------------------------------------------------------
+
+  // --- Fetch layers (ports sample, piracy from backend, storms from backend)
+  useEffect(() => {
+    void (async () => {
+      try {
+        const p: PortsFC = await fetch('/data/ports-sample.geojson').then((r) => r.json());
+        setPorts(p);
+      } catch {}
+      try {
+        const pr: PiracyFC = await fetch(`${API_BASE}/data/piracy`).then((r) => r.json());
+        setPiracy(pr);
+      } catch {}
+      try {
+        const raw = await fetch(`${API_BASE}/storms`).then((r) => r.json());
+        const norm = normalizeStorms(raw);
+        setStorms(norm);
+      } catch {}
+    })();
+  }, []);
 
   // --- layers
   const routeLayer: LayerProps = {
@@ -511,6 +590,35 @@ useEffect(() => {
       'line-width': 10,
       'line-opacity': 0.18,
       'line-blur': 1.5,
+    },
+  };
+
+  // Storms layers (points + label)
+  const stormsCircle: LayerProps = {
+    id: 'storms-circle',
+    type: 'circle',
+    paint: {
+      'circle-radius': 5,
+      'circle-color': '#fde047', // yellow
+      'circle-stroke-width': 1,
+      'circle-stroke-color': '#a16207',
+    },
+    layout: { visibility: 'visible' },
+  };
+
+  const stormsLabel: LayerProps = {
+    id: 'storms-label',
+    type: 'symbol',
+    layout: {
+      'text-field': ['coalesce', ['get', 'name'], 'Storm'],
+      'text-size': 12,
+      'text-offset': [0, 1],
+      'text-anchor': 'top',
+    },
+    paint: {
+      'text-color': '#fde68a',
+      'text-halo-color': '#0f172a',
+      'text-halo-width': 1.2,
     },
   };
 
@@ -570,7 +678,7 @@ useEffect(() => {
             </Source>
           )}
 
-          {/* Hazard polygon (if avoidance is on) */}
+          {/* Hazard polygon */}
           {hazardPoly && (
             <Source id="hazard" type="geojson" data={hazardPoly}>
               <Layer
@@ -586,37 +694,22 @@ useEffect(() => {
             </Source>
           )}
 
-          {/* Bathymetry raster (placeholder) */}
+          {/* Bathymetry placeholder */}
           {layers.bathy && (
-            <Source
-              id="bathy"
-              type="raster"
-              tiles={[
-                // Demo tile for visual effect; replace with GEBCO later.
-                'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              ]}
-              tileSize={256}
-            >
+            <Source id="bathy" type="raster" tiles={['https://tile.openstreetmap.org/{z}/{x}/{y}.png']} tileSize={256}>
               <Layer id="bathy-layer" type="raster" paint={{ 'raster-opacity': 0.25 }} />
             </Source>
           )}
 
-          {/* Weather tiles (placeholder) */}
-          {layers.weather && (
-            <Source
-              id="weather"
-              type="raster"
-              tiles={[
-                // Example placeholder; swap to real provider later.
-                'https://tile.openstreetmap.org/{z}/{x}/{y}.png',
-              ]}
-              tileSize={256}
-            >
-              <Layer id="weather-layer" type="raster" paint={{ 'raster-opacity': 0.18 }} />
+          {/* Storms (from backend) */}
+          {layers.weather && storms && storms.features.length > 0 && (
+            <Source id="storms" type="geojson" data={storms}>
+              <Layer {...stormsCircle} />
+              <Layer {...stormsLabel} />
             </Source>
           )}
 
-          {/* Ports (points) */}
+          {/* Ports */}
           {layers.ports && ports && (
             <Source id="ports" type="geojson" data={ports}>
               <Layer
@@ -632,42 +725,32 @@ useEffect(() => {
             </Source>
           )}
 
-          {/* Piracy (polygons + points) */}
+          {/* Piracy */}
           {layers.piracy && piracy && (
             <Source id="piracy" type="geojson" data={piracy}>
               <Layer
                 id="piracy-fill"
                 type="fill"
-                paint={{
-                  'fill-color': '#ef4444',
-                  'fill-opacity': 0.15,
-                }}
+                paint={{ 'fill-color': '#ef4444', 'fill-opacity': 0.15 }}
                 filter={['==', ['geometry-type'], 'Polygon']}
               />
               <Layer
                 id="piracy-outline"
                 type="line"
-                paint={{
-                  'line-color': '#ef4444',
-                  'line-width': 2,
-                  'line-opacity': 0.7,
-                }}
+                paint={{ 'line-color': '#ef4444', 'line-width': 2, 'line-opacity': 0.7 }}
                 filter={['==', ['geometry-type'], 'Polygon']}
               />
               <Layer
                 id="piracy-points"
                 type="circle"
-                paint={{
-                  'circle-radius': 3.5,
-                  'circle-color': '#ef4444',
-                }}
+                paint={{ 'circle-radius': 3.5, 'circle-color': '#ef4444' }}
                 filter={['==', ['geometry-type'], 'Point']}
               />
             </Source>
           )}
         </Map>
 
-        {/* Draggable Floating control panel */}
+        {/* Draggable control panel */}
         <DraggablePanel initial={{ x: 24, y: 24 }}>
           <div className="w-[min(620px,calc(100%-2rem))] glass p-4 shadow-xl space-y-3 fade-up">
             <div className="flex items-center justify-between gap-3">
@@ -675,7 +758,6 @@ useEffect(() => {
               <button onClick={swap} className="btn btn-ghost">Swap ↕</button>
             </div>
 
-            {/* NEW: City search boxes */}
             <div className="grid grid-cols-1 gap-2">
               <CitySearch
                 label="Origin city"
@@ -697,7 +779,6 @@ useEffect(() => {
               />
             </div>
 
-            {/* Manual overrides (keep for power users) */}
             <div className="grid grid-cols-2 gap-2">
               <input className="input" name="originLat" value={form.originLat} onChange={onChange} onKeyDown={onKeyDown} placeholder="Origin lat" />
               <input className="input" name="originLon" value={form.originLon} onChange={onChange} onKeyDown={onKeyDown} placeholder="Origin lon" />
@@ -705,7 +786,6 @@ useEffect(() => {
               <input className="input" name="destLon"   value={form.destLon}   onChange={onChange} onKeyDown={onKeyDown} placeholder="Destination lon" />
             </div>
 
-            {/* Waypoints block */}
             <Waypoints value={waypoints} onChange={setWaypoints} ports={ports} />
 
             <div className="flex items-center gap-2 flex-wrap">
@@ -713,17 +793,11 @@ useEffect(() => {
               <button onClick={plan} disabled={loading} className="btn btn-primary">
                 {loading ? (<><Spinner /><span className="ml-2">Planning…</span></>) : 'Plan route'}
               </button>
-              <button
-                onClick={() => route && fitToRoute(route)}
-                disabled={!route}
-                className="btn btn-ghost"
-                title="Fit to route"
-              >
+              <button onClick={() => route && fitToRoute(route)} disabled={!route} className="btn btn-ghost" title="Fit to route">
                 Fit ↗
               </button>
             </div>
 
-            {/* Weights */}
             <div className="mt-2 grid grid-cols-1 sm:grid-cols-3 gap-3">
               <div>
                 <label className="block text-xs mb-1">Piracy weight ({piracyWeight.toFixed(2)})</label>
@@ -739,7 +813,6 @@ useEffect(() => {
               </div>
             </div>
 
-            {/* Presets (optional quick fill) */}
             <div className="flex items-center gap-2 flex-wrap">
               {presets.map((p) => (
                 <button key={p.label} onClick={() => applyPreset(p)} className="btn btn-ghost text-xs px-2 py-1">
@@ -748,22 +821,15 @@ useEffect(() => {
               ))}
             </div>
 
-            {/* Layer toggles */}
             <LayerToggles value={layers} onChange={setLayers} />
 
-            {/* Avoidance toggle */}
             <div className="mt-2">
               <label className="flex items-center gap-2">
-                <input
-                  type="checkbox"
-                  checked={avoidOn}
-                  onChange={() => setAvoidOn((v) => !v)}
-                />
+                <input type="checkbox" checked={avoidOn} onChange={() => setAvoidOn((v) => !v)} />
                 Avoid demo hazard (midpoint circle, {HAZARD_RADIUS_NM} nm)
               </label>
             </div>
 
-            {/* Stats */}
             <div className="text-sm text-white/80 pt-2 border-t border-white/10 mt-2">
               <div>Distance: {distanceNm ? `${distanceNm.toFixed(1)} nm` : '—'}</div>
               <div>ETA: {etaHours ? `${etaHours.toFixed(1)} h @ ${asNum(form.speedKts)} kts` : '—'}</div>
@@ -776,7 +842,6 @@ useEffect(() => {
           </div>
         </DraggablePanel>
 
-        {/* Loading overlay */}
         {loading && (
           <div className="absolute inset-0 grid place-items-center bg-black/20 backdrop-blur-[1px]">
             <div className="glass px-4 py-3 flex items-center gap-3">
@@ -787,7 +852,6 @@ useEffect(() => {
         )}
       </div>
 
-      {/* Toasts */}
       {err && <Toast message={err} onClose={() => setErr(null)} />}
       {toast && <Toast message={toast} onClose={() => setToast(null)} />}
     </div>
